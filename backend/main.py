@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -6,6 +6,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaLLM
 from langchain_classic.chains import RetrievalQA
 import os
+import shutil
 
 # 1. Initialize FastAPI
 app = FastAPI(title="Enterprise RAG API", version="1.0")
@@ -63,6 +64,33 @@ async def startup_event():
 @app.get("/")
 async def root():
     return {"message": "RAG Backend is running securely."}
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+        
+    try:
+        # 1. Ensure the data directory exists and save the file
+        if not os.path.exists("data"):
+            os.makedirs("data")
+            
+        file_path = f"data/{file.filename}"
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # 2. Import existing script to chunk and vectorize the new PDF
+        from rag_engine import create_vector_db
+        create_vector_db(file_path)
+        
+        # 3. Reboot the AI models so they read the newly updated database
+        await startup_event()
+        
+        return {"message": f"Successfully ingested {file.filename}"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 # 5. The core endpoint that takes the question and returns the AI answer
 @app.post("/ask")
