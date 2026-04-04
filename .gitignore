@@ -1,0 +1,9 @@
+# Python and Backend
+backend/venv/
+backend/__pycache__/
+backend/vectorstore/
+backend/data/
+
+# Node and Frontend
+frontend/node_modules/
+frontend/.next/
