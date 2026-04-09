@@ -23,6 +23,15 @@ def create_vector_db(pdf_path: str):
     print(f"Success! Vector database saved to {DB_FAISS_PATH}.")
 
 if __name__ == "__main__":
-    sample_pdf = 'data/sample.pdf'
-    if os.path.exists(sample_pdf):
-        create_vector_db(sample_pdf)
+    # If run manually, scan the data folder and process ANY pdf it finds
+    data_dir = "data"
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+        print("Created 'data' directory. Drop PDFs here.")
+    else:
+        pdf_files = [f for f in os.listdir(data_dir) if f.endswith('.pdf')]
+        if not pdf_files:
+            print("No PDFs found in the 'data' directory.")
+        else:
+            for pdf in pdf_files:
+                create_vector_db(os.path.join(data_dir, pdf))

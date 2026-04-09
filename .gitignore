@@ -1,6 +1,14 @@
+# Mac OS
+.DS_Store
+
+# VS Code
+.vscode/
+
 # Python and Backend
 backend/venv/
 backend/__pycache__/
+__pycache__/
+*.pyc
 backend/vectorstore/
 backend/data/
 
