@@ -1,114 +1,157 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_ollama import OllamaLLM
-from langchain_classic.chains import RetrievalQA
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
-import shutil
+from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import uuid4
 
-# 1. Initialize FastAPI
-app = FastAPI(title="Enterprise RAG API", version="1.0")
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
+from langchain_classic.chains import RetrievalQA
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaLLM
+from pydantic import BaseModel, Field
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from rag_engine import (
+    DATA_DIR,
+    build_vector_db,
+    get_embeddings,
+    load_active_index,
+    publish_active_index,
 )
 
-# 2. Define what a user request looks like
+logger = logging.getLogger(__name__)
+MAX_UPLOAD_BYTES = int(os.getenv("RAG_MAX_UPLOAD_BYTES", 20 * 1024 * 1024))
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("RAG_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
+
 class QueryRequest(BaseModel):
-    question: str
+    question: str = Field(min_length=1, max_length=4000)
 
-# 3. Global variables to hold our AI models in memory
-qa_chain = None
 
-# 4. Load the AI components when the server starts
-@app.on_event("startup")
-async def startup_event():
-    global qa_chain
-    print("Booting up AI models...")
-    
-    DB_FAISS_PATH = 'vectorstore/db_faiss'
-    
-    if not os.path.exists(DB_FAISS_PATH):
-        print("Warning: Vector DB not found. Run rag_engine.py first.")
-        return
+embeddings: HuggingFaceEmbeddings | None = None
+qa_chain: RetrievalQA | None = None
+index_lock = asyncio.Lock()
 
-    # Load the exact same embedding model we used to chunk the PDF
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    
-    # Load our database
-    db = FAISS.load_local(
-        DB_FAISS_PATH, 
-        embeddings, 
-        allow_dangerous_deserialization=True # Required for local FAISS loading
-    )
-    
-    # Connect to local Ollama (Llama 3.2)
-    llm = OllamaLLM(model="llama3.2")
-    
-    # Create the RAG Chain: Connect the Database to the LLM
-    retriever = db.as_retriever(search_kwargs={"k": 3}) # Get top 3 most relevant chunks
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
+
+def make_qa_chain(db: FAISS) -> RetrievalQA:
+    retriever = db.as_retriever(search_kwargs={"k": 3})
+    return RetrievalQA.from_chain_type(
+        llm=OllamaLLM(model=os.getenv("RAG_OLLAMA_MODEL", "llama3.2")),
         chain_type="stuff",
         retriever=retriever,
-        return_source_documents=True # Critical for Enterprise: Proves where the AI got the answer
+        return_source_documents=True,
     )
-    print("AI Engine Ready!")
+
+
+def load_runtime() -> tuple[HuggingFaceEmbeddings, RetrievalQA | None]:
+    model = get_embeddings()
+    db = load_active_index(model)
+    return model, make_qa_chain(db) if db is not None else None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global embeddings, qa_chain
+    embeddings, qa_chain = await run_in_threadpool(load_runtime)
+    if qa_chain is None:
+        logger.info("No FAISS index found; upload PDFs to initialize the RAG engine.")
+    yield
+
+
+app = FastAPI(title="Local RAG API", version="1.1", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
 
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend is running securely."}
+    return {"message": "Local single-user RAG backend is running."}
+
+
+def index_all_pdfs() -> RetrievalQA:
+    if embeddings is None:
+        raise RuntimeError("Embedding model is not initialized.")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    pdf_paths = list(DATA_DIR.glob("*.pdf")) + list(DATA_DIR.glob("*.PDF"))
+    db, version_path = build_vector_db(pdf_paths, embeddings)
+    candidate_chain = make_qa_chain(db)
+    publish_active_index(version_path)
+    return candidate_chain
+
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    if not file.filename.endswith('.pdf'):
+    original_name = Path((file.filename or "").replace("\\", "/")).name
+    if not original_name.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-        
-    try:
-        # 1. Ensure the data directory exists and save the file
-        if not os.path.exists("data"):
-            os.makedirs("data")
-            
-        file_path = f"data/{file.filename}"
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        # 2. Import existing script to chunk and vectorize the new PDF
-        from rag_engine import create_vector_db
-        create_vector_db(file_path)
-        
-        # 3. Reboot the AI models so they read the newly updated database
-        await startup_event()
-        
-        return {"message": f"Successfully ingested {file.filename}"}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
 
-# 5. The core endpoint that takes the question and returns the AI answer
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    stored_path = DATA_DIR / f"{uuid4().hex}__{original_name}"
+    size = 0
+    try:
+        header = await file.read(5)
+        if header != b"%PDF-":
+            raise HTTPException(status_code=400, detail="The uploaded file is not a valid PDF.")
+        with stored_path.open("wb") as destination:
+            destination.write(header)
+            size += len(header)
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"PDF exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB upload limit.",
+                    )
+                destination.write(chunk)
+
+        async with index_lock:
+            candidate_chain = await run_in_threadpool(index_all_pdfs)
+            global qa_chain
+            qa_chain = candidate_chain
+        return {"message": f"Successfully ingested {original_name}"}
+    except HTTPException:
+        stored_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        stored_path.unlink(missing_ok=True)
+        logger.exception("PDF ingestion failed")
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="PDF ingestion failed. Check backend logs.") from exc
+    finally:
+        await file.close()
+
+
 @app.post("/ask")
 async def ask_question(request: QueryRequest):
-    if qa_chain is None:
-        raise HTTPException(status_code=503, detail="AI engine is not initialized or DB is missing.")
-    
+    chain = qa_chain
+    if chain is None:
+        raise HTTPException(status_code=503, detail="AI engine is not initialized or no PDF is indexed.")
+
     try:
-        # Pass the question to the AI
-        response = qa_chain.invoke({"query": request.question})
-        
-        # Format the output so we can see the answer AND the citations
-        sources = [doc.metadata.get('page', 'Unknown') for doc in response['source_documents']]
-        
-        return {
-            "question": request.question,
-            "answer": response['result'],
-            "cited_pages": sources
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        response = await run_in_threadpool(chain.invoke, {"query": request.question})
+        citations = []
+        for document in response["source_documents"]:
+            name = document.metadata.get("document_name", "Unknown document")
+            page = document.metadata.get("page")
+            citation = {"document": name, "page": page + 1 if isinstance(page, int) else "Unknown"}
+            if citation not in citations:
+                citations.append(citation)
+        return {"question": request.question, "answer": response["result"], "citations": citations}
+    except Exception as exc:
+        logger.exception("Question processing failed")
+        raise HTTPException(status_code=500, detail="Question processing failed. Check backend logs.") from exc

@@ -1,150 +1,155 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
+
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000").replace(/\/$/, "");
+
+type Citation = { document: string; page: number | string };
+type ChatMessage = { role: "user" | "ai"; content: string; citations?: Citation[] };
+
+async function requestApi<T>(path: string, init: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, init);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = typeof payload.detail === "string" ? payload.detail : `Request failed (${response.status}).`;
+    throw new Error(detail);
+  }
+  return payload as T;
+}
 
 export default function Home() {
   const [question, setQuestion] = useState("");
-  const [chatHistory, setChatHistory] = useState<{ role: string; content: string; citations?: number[] }[]>([]);
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const dragDepth = useRef(0);
 
-  // --- Drag and Drop Handlers ---
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
+  const handleDragOver = (event: React.DragEvent) => {
+    event.preventDefault();
+  };
+
+  const handleDragEnter = (event: React.DragEvent) => {
+    event.preventDefault();
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    dragDepth.current += 1;
     setIsDragging(true);
   };
 
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
+  const handleDragLeave = (event: React.DragEvent) => {
+    event.preventDefault();
+    if (dragDepth.current === 0) return;
+    dragDepth.current -= 1;
+    if (dragDepth.current === 0) setIsDragging(false);
   };
 
-  const handleDrop = async (e: React.DragEvent) => {
-    e.preventDefault();
+  const handleDrop = async (event: React.DragEvent) => {
+    event.preventDefault();
+    dragDepth.current = 0;
     setIsDragging(false);
-
-    const files = e.dataTransfer.files;
-    if (files.length === 0) return;
-
-    const file = files[0];
-    if (file.type !== "application/pdf") {
-      setChatHistory(prev => [...prev, { role: "ai", content: "⚠️ Error: Please upload a valid PDF document." }]);
+    const file = event.dataTransfer.files[0];
+    if (!file) return;
+    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+      setChatHistory((previous) => [...previous, { role: "ai", content: "Please upload a PDF document." }]);
       return;
     }
 
-    // Start the upload process
     setIsLoading(true);
-    setChatHistory(prev => [...prev, { role: "ai", content: `📥 Uploading and vectorizing '${file.name}'... (This may take a minute)` }]);
-
     const formData = new FormData();
     formData.append("file", file);
-
     try {
-      const res = await fetch("http://127.0.0.1:8000/upload", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (res.ok) {
-        setChatHistory(prev => [...prev, { role: "ai", content: `✅ Success! '${file.name}' has been embedded into the AI database. You can now query it.` }]);
-      } else {
-        const errorData = await res.json();
-        setChatHistory(prev => [...prev, { role: "ai", content: `❌ Error: ${errorData.detail}` }]);
-      }
+      await requestApi<{ message: string }>("/upload", { method: "POST", body: formData });
+      setChatHistory((previous) => [...previous, {
+        role: "ai",
+        content: `Successfully added '${file.name}' to the searchable document collection.`,
+      }]);
     } catch (error) {
-      setChatHistory(prev => [...prev, { role: "ai", content: `❌ Network error while uploading. Ensure your backend is running.` }]);
+      const message = error instanceof Error ? error.message : "Unknown upload error.";
+      setChatHistory((previous) => [...previous, { role: "ai", content: `Upload failed: ${message}` }]);
+    } finally {
+      setIsLoading(false);
     }
-    setIsLoading(false);
   };
 
-  // --- Query Handler ---
-  const askQuestion = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const askQuestion = async (event: React.FormEvent) => {
+    event.preventDefault();
     if (!question.trim()) return;
-
-    const newChat = [...chatHistory, { role: "user", content: question }];
+    const userQuestion = question;
+    const newChat: ChatMessage[] = [...chatHistory, { role: "user", content: userQuestion }];
     setChatHistory(newChat);
     setQuestion("");
     setIsLoading(true);
-
     try {
-      const res = await fetch("http://127.0.0.1:8000/ask", {
+      const data = await requestApi<{ answer: string; citations: Citation[] }>("/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: newChat[newChat.length - 1].content }),
+        body: JSON.stringify({ question: userQuestion }),
       });
-
-      const data = await res.json();
-      setChatHistory([...newChat, { role: "ai", content: data.answer, citations: data.cited_pages }]);
+      setChatHistory([...newChat, { role: "ai", content: data.answer, citations: data.citations }]);
     } catch (error) {
-      setChatHistory([...newChat, { role: "ai", content: "Error connecting to the backend engine." }]);
+      const message = error instanceof Error ? error.message : "Unknown query error.";
+      setChatHistory([...newChat, { role: "ai", content: `Query failed: ${message}` }]);
+    } finally {
+      setIsLoading(false);
     }
-    setIsLoading(false);
   };
 
   return (
-    <main 
+    <main
       className={`flex min-h-screen flex-col items-center p-12 transition-colors duration-300 ${isDragging ? "bg-blue-50" : "bg-gray-50"} font-sans text-gray-900`}
+      onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      {/* Visual Overlay when dragging */}
       {isDragging && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-blue-500 bg-opacity-10 border-8 border-blue-500 border-dashed pointer-events-none rounded-xl m-4">
-          <h2 className="text-4xl font-bold text-blue-600 animate-pulse bg-white p-8 rounded-2xl shadow-lg">Drop PDF to Ingest</h2>
+        <div className="pointer-events-none fixed inset-0 z-50 m-4 flex items-center justify-center rounded-xl border-8 border-dashed border-blue-500 bg-blue-500/10">
+          <h2 className="rounded-2xl bg-white p-8 text-4xl font-bold text-blue-600 shadow-lg">Drop PDF to Ingest</h2>
         </div>
       )}
 
-      <div className="w-full max-w-4xl bg-white shadow-xl rounded-2xl p-8 border border-gray-100 relative">
-        <div className="flex justify-between items-center mb-2">
-            <h1 className="text-3xl font-bold">Enterprise RAG Engine</h1>
-            <span className="text-xs bg-gray-100 text-gray-500 px-3 py-1 rounded-full border border-gray-200">Drag & Drop PDF Enabled</span>
+      <div className="relative w-full max-w-4xl rounded-2xl border border-gray-100 bg-white p-8 shadow-xl">
+        <div className="mb-2 flex items-center justify-between">
+          <h1 className="text-3xl font-bold">Local RAG Engine</h1>
+          <span className="rounded-full border border-gray-200 bg-gray-100 px-3 py-1 text-xs text-gray-500">Drag and drop PDF enabled</span>
         </div>
-        <p className="text-gray-500 mb-8 border-b pb-4">Secure, cited document intelligence.</p>
+        <p className="mb-8 border-b pb-4 text-gray-500">Ask questions across your local PDF collection.</p>
 
-        <div className="flex flex-col space-y-4 mb-8 h-[500px] overflow-y-auto p-4 bg-gray-50 rounded-xl border border-gray-200">
+        <div className="mb-8 flex h-[500px] flex-col space-y-4 overflow-y-auto rounded-xl border border-gray-200 bg-gray-50 p-4">
           {chatHistory.length === 0 ? (
-            <div className="text-center mt-auto mb-auto flex flex-col items-center gap-2">
-                <p className="text-gray-400">Ready to query.</p>
-                <p className="text-xs text-gray-400 bg-white px-3 py-1 rounded-md border border-gray-100 shadow-sm">Drag any PDF anywhere on this page to update the AI's knowledge.</p>
+            <div className="my-auto flex flex-col items-center gap-2 text-center">
+              <p className="text-gray-400">Ready to query.</p>
+              <p className="rounded-md border border-gray-100 bg-white px-3 py-1 text-xs text-gray-400 shadow-sm">Drop a PDF anywhere on this page to add it to the collection.</p>
             </div>
           ) : (
-            chatHistory.map((msg, index) => (
-              <div key={index} className={`p-4 rounded-lg max-w-[80%] ${msg.role === "user" ? "bg-blue-600 text-white self-end ml-auto" : "bg-white border border-gray-200 self-start shadow-sm"}`}>
-                <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
-                {msg.citations && msg.citations.length > 0 && (
-                  <div className="mt-3 pt-3 border-t border-gray-100 flex gap-2 text-xs text-gray-500">
-                    <span className="font-semibold">Cited Pages:</span>
-                    {msg.citations.map((page, i) => (
-                      <span key={i} className="bg-gray-100 px-2 py-1 rounded-md">pg. {page}</span>
+            chatHistory.map((message, index) => (
+              <div key={index} className={`max-w-[80%] rounded-lg p-4 ${message.role === "user" ? "ml-auto self-end bg-blue-600 text-white" : "self-start border border-gray-200 bg-white shadow-sm"}`}>
+                <p className="whitespace-pre-wrap leading-relaxed">{message.content}</p>
+                {message.citations && message.citations.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2 border-t border-gray-100 pt-3 text-xs text-gray-500">
+                    <span className="font-semibold">Sources:</span>
+                    {message.citations.map((citation, citationIndex) => (
+                      <span key={`${citation.document}-${citation.page}-${citationIndex}`} className="rounded-md bg-gray-100 px-2 py-1">
+                        {citation.document}, pg. {citation.page}
+                      </span>
                     ))}
                   </div>
                 )}
               </div>
             ))
           )}
-          {isLoading && !isDragging && (
-            <div className="self-start text-sm text-gray-500 animate-pulse bg-white p-4 rounded-lg border border-gray-200 shadow-sm">
-              Processing...
-            </div>
-          )}
+          {isLoading && <div className="self-start animate-pulse rounded-lg border border-gray-200 bg-white p-4 text-sm text-gray-500 shadow-sm">Processing...</div>}
         </div>
 
         <form onSubmit={askQuestion} className="flex gap-4">
           <input
             type="text"
             value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            placeholder="Ask a question about the document..."
-            className="flex-1 p-4 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
+            onChange={(event) => setQuestion(event.target.value)}
+            placeholder="Ask a question about your documents..."
+            className="flex-1 rounded-xl border border-gray-300 p-4 transition-all focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500"
             disabled={isLoading}
           />
-          <button
-            type="submit"
-            disabled={isLoading || !question.trim()}
-            className="bg-blue-600 text-white px-8 py-4 rounded-xl font-medium hover:bg-blue-700 disabled:bg-blue-300 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg"
-          >
+          <button type="submit" disabled={isLoading || !question.trim()} className="rounded-xl bg-blue-600 px-8 py-4 font-medium text-white shadow-md transition-all hover:bg-blue-700 hover:shadow-lg disabled:cursor-not-allowed disabled:bg-blue-300">
             Query
           </button>
         </form>
